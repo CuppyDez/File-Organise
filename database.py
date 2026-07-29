@@ -128,6 +128,9 @@ def get_rule_for_extension(extension):
         return row[0]
     return None
 
+# ensure the database and tables exist when the module is imported
+initialise_database()
+
 #run setup when script executes
 if __name__ == "__main__":
     initialise_database()

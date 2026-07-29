@@ -1,2 +1,5 @@
-/database.db
-/__pycache__
+# ignore local database
+*.db 
+#ignore python cache files
+__pycache__/
+*.pyc 
