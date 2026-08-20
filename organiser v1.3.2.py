@@ -3,9 +3,13 @@ import time
 import shutil
 import tkinter as tk
 import queue
+import threading
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+import pystray
+from PIL import Image, ImageDraw
 
 from database import log_action
 from database import add_rule
@@ -14,49 +18,38 @@ from database import get_all_rules
 from database import delete_rule
 from database import get_action_history
 
-# queue to pass downloaded file info from the background
 file_queue = queue.Queue()
 
-# handles what happens whenever a file change is detected
 class Test(FileSystemEventHandler):
     def __init__(self):
-        # keeps track of recently processed files
         self.recent_files = {}
 
-    # function automatically runs whenever a new file is created
     def on_created(self, event):
-        # ignore folders, only care about actual files
         if not event.is_directory:
             file_name = os.path.basename(event.src_path)
             file_path = event.src_path
             current_time = time.time()
 
-            # if this file was processed less than 1 second ago, ignore the duplicate event
             if file_name in self.recent_files:
                 if current_time - self.recent_files[file_name] < 1.0:
                     return
 
-            # ignore temporary files created by browsers during an active download    
             if file_name.endswith(('.crdownload', '.tmp', '.part')):
                 return
-            # wait until the file finishes transferring
+
             historical_size = -1
             while True:
                 try:
                     current_size = os.path.getsize(file_path)
-                    # if the size matches what it was 0.2 seconds ago, the download is complete
                     if current_size == historical_size:
                         break
                     historical_size = current_size
                     time.sleep(0.2)
                 except FileNotFoundError:
-                    # if file vanishes or is renamed mid-download stop tracking
                     return
 
-            # log the time file finished downloading
             self.recent_files[file_name] = time.time()
 
-            # check if a saved rule already exists for this file type
             _, ext = os.path.splitext(file_name)
             existing_target_folder = get_rule_for_extension(ext.lower())
 
@@ -64,7 +57,6 @@ class Test(FileSystemEventHandler):
                 try:
                     destination = os.path.join(existing_target_folder, file_name)
 
-                    # if file with same name already exists in target folder add number to end
                     if os.path.exists(destination):
                         base, ext_str = os.path.splitext(file_name)
                         counter = 1
@@ -75,41 +67,32 @@ class Test(FileSystemEventHandler):
                     shutil.move(file_path, destination)
                     log_action("AUTO_SORTED", file_name, file_path, destination)
                     print(f"Auto-sorted {file_name} to {destination}")
-                    # skip opening the popup window if auto sorted
                     return 
                 except Exception as e:
                     print(f"Error auto-sorting file: {e}")
             
             print(f"New File {file_name} has been downloaded")
-
             file_queue.put((file_name, file_path))
     
     def trigger_popup(self, file_name, file_path, main_root):
-        # create a blank desktop window
         root = tk.Toplevel(main_root)
         root.title("File Organiser")
-        
-        # force the pop-up window to appear on top of everything
         root.attributes("-topmost", True)
-        # adds the text prompt inside the window
+
         label = tk.Label(root, text=f"New file detected: {file_name}\nWhat would you like to do with it?", padx=20, pady=20)
         label.pack()
 
-        # checkbox for user to save destination preference as a rule
         save_rule_var = tk.IntVar(value=0)
         _, file_ext = os.path.splitext(file_name)
         rule_checkbox = tk.Checkbutton(root, text=f"Always move '{file_ext}' files to this location", variable=save_rule_var)
         rule_checkbox.pack(pady=5)
         
-        # handles a file with the same name existing there already
         def handle_collision(destination_folder, target_name):
             full_destination = os.path.join(destination_folder, target_name)
 
-            # if no duplicate just return path as is
             if not os.path.exists(full_destination):
                 return full_destination
 
-            # ask user whether to replace rename or cancel
             answer = messagebox.askyesnocancel(
                 "File Name Conflict", 
                 f"A file named '{target_name}' already exists in this folder. \n\n"
@@ -117,130 +100,81 @@ class Test(FileSystemEventHandler):
                 "Click NO to RENAME the new file. \n"
                 "Click CANCEL to STOP the transfer"
             )
-            if answer is True: # user clicked yes (replace)
+            if answer is True:
                 return full_destination
-            
-            elif answer is False: # user clicked no (rename)
-                # split name and extension
+            elif answer is False:
                 base, ext = os.path.splitext(target_name)
-
-                # safety check whether chosen name also exists (loop back)
                 while True:
-                    # ask user for custom file name
                     custom_name = simpledialog.askstring("Rename File", "Enter new name for the file:", initialvalue=base)
-
-                    # if they provided a name
                     if custom_name:
-                        # make sure the user didnt type out extension themselves
                         if not custom_name.endswith(ext):
                             custom_name += ext
                         
                         new_destination = os.path.join(destination_folder, custom_name)
-
-                        # if the name is completely free break out and return the path
                         if not os.path.exists(new_destination):
                             return new_destination
 
-                        # safety check whether chosen name also exists (loop back)
                         messagebox.showwarning(
                             "Name Taken", 
                             f"A file named '{custom_name}' already exists in this folder.\n"
                             "Please choose a different name."
                         )
                     else:
-                        # if they hit cancel on rename text box stop whole transfer
                         return None
-            
             else:
-                # user clicked cancel or closed window (before rename)
                 return None
 
-        # placeholder commands that run when buttons are pressed
         def option_existing():
             nonlocal file_name, file_path
-
-            print("Action: Move to Existing Folder")
-
-            # hide main popup temporarily
             root.withdraw()
-
-            # open a window so the user can select destination folder
             chosen_folder = filedialog.askdirectory(title="Select Destination Folder")
 
-            # if user selected folder and didnt hit cancel
             if chosen_folder:
-                # pass details through collision handler first
                 destination = handle_collision(chosen_folder, file_name)
-
                 if destination:
-                    # update file_name to what they renamed it to if they did
                     file_name = os.path.basename(destination)
                     try:
-                        # cut and paste file using shutil
                         shutil.move(file_path, destination)
-                        
-                        # log the file move to database history
                         log_action("MOVED_FILE", file_name, file_path, destination)
 
-                        # if user ticked checkbox save new rule in database
                         if save_rule_var.get() == 1:
                             _, ext = os.path.splitext(file_name)
                             add_rule(ext.lower(), chosen_folder)
                             print(f"Saved new rule: {ext.lower()} -> {chosen_folder}")
                         
                         print(f"Successfully moved {file_name} to {chosen_folder}")
-
                     except Exception as e:
                         print(f"Error moving file: {e}")
-                    
                 root.destroy()
             else:
-                # if cancelled folder select bring popup back
                 root.deiconify()
         
         def option_new():
             nonlocal file_name, file_path
-        
-            print("Action: Create New Folder")
-            # hide main popup temporarily
             root.withdraw()
-
-            # ask user where to make the new folder
             parent_folder = filedialog.askdirectory(title="Where should the new folder be created?")
 
             if parent_folder:
-                # ask user what to name new folder
                 new_folder_name = simpledialog.askstring("New Folder", "Enter new folder name:")
 
                 if new_folder_name:
                     new_folder_path = os.path.join(parent_folder, new_folder_name)
-
                     try:
-                        # if exists keep asking for new name till unique
                         while os.path.exists(new_folder_path):
                             new_folder_name = simpledialog.askstring("Folder Exists", f"'{new_folder_name}' already exists. Enter a different name:")
-
-                            # if they hit cancel stop function
                             if not new_folder_name:
-                                # show popup again
                                 root.deiconify()
                                 return
-                            
                             new_folder_path = os.path.join(parent_folder, new_folder_name)
                         
                         if not os.path.exists(new_folder_path):
                             os.makedirs(new_folder_path)
-                            
-                            # log new folder creation to database history
                             log_action("CREATED_FOLDER", new_folder_name, None, new_folder_path)
                             
                             destination = os.path.join(new_folder_path, file_name)
                             shutil.move(file_path, destination)
-                            
-                            # log file move to database history
                             log_action("MOVED_FILE", file_name, file_path, destination)
 
-                            # if user ticked checkbox save new rule in database
                             if save_rule_var.get() == 1:
                                 _, ext = os.path.splitext(file_name)
                                 add_rule(ext.lower(), new_folder_path)
@@ -253,17 +187,14 @@ class Test(FileSystemEventHandler):
                         print(f"Error creating folder or moving file: {e}")
                         root.deiconify()
                 else:
-                    # if cancelled at "new folder name"
                     root.deiconify()
             else:
-                # if canceled at initial parent folder select
                 root.deiconify()
         
         def option_leave():
             print("Action: Leave in Downloads")
             root.destroy()
 
-        # 3 buttons
         btnexist = tk.Button(root, text="Move to Existing Folder", command=option_existing)
         btnexist.pack(fill='x', padx=20, pady=5)
 
@@ -273,86 +204,50 @@ class Test(FileSystemEventHandler):
         btnleave = tk.Button(root, text="Leave in Downloads Folder", command=option_leave)
         btnleave.pack(fill='x', padx=20, pady=5)
 
-# locate current system's download folder
-downloads_folder = os.path.expanduser("~\Downloads")
+def create_tray_image():
+    image = Image.new('RGB', (64, 64), color=(30, 144, 255))
+    dc = ImageDraw.Draw(image)
+    dc.rectangle((16, 16, 48, 48), fill=(255, 255, 255))
+    return image
 
-# set up watchdog observer to look at target folder
+downloads_folder = os.path.expanduser("~\Downloads")
 event_handler = Test()
 observer = Observer()
 observer.schedule(event_handler, path=downloads_folder, recursive=False)
-
-print(f"Watching: {downloads_folder}")
-
-
-def dashboard_view_history():
-    history = get_action_history()
-    
-    if not history:
-        messagebox.showinfo("File History", "No file movements logged yet.")
-        return
-
-    # create window
-    history_win = tk.Toplevel(main_root)
-    history_win.title("File Move History")
-    history_win.geometry("600x350")
-    history_win.attributes("-topmost", True)
-
-    tk.Label(history_win, text="Recent File Actions Log", font=("Arial", 10, "bold")).pack(pady=10)
-
-    # frame to hold table and scrollbar
-    frame = tk.Frame(history_win)
-    frame.pack(fill='both', expand=True, padx=15, pady=5)
-
-    # scrollbar
-    scrollbar = ttk.Scrollbar(frame)
-    scrollbar.pack(side='right', fill='y')
-
-    # treeview Table
-    columns = ("file_name", "action", "destination")
-    tree = ttk.Treeview(frame, columns=columns, show='headings', yscrollcommand=scrollbar.set)
-    scrollbar.config(command=tree.yview)
-
-    # headings
-    tree.heading("file_name", text="File Name")
-    tree.heading("action", text="Action")
-    tree.heading("destination", text="Destination")
-
-    # column widths
-    tree.column("file_name", width=150)
-    tree.column("action", width=110)
-    tree.column("destination", width=300)
-
-    # insert log rows into table
-    for log in history:
-        tree.insert('', tk.END, values=(log["file_name"], log["action"], log["destination"]))
-
-    tree.pack(fill='both', expand=True)
-
-def check_queue(main_root, event_handler):
-    try:
-        # check queue without blocking
-        file_name, file_path = file_queue.get_nowait()
-        # trigger popup safely on main thread
-        event_handler.trigger_popup(file_name, file_path, main_root)
-    except queue.Empty:
-        pass
-
-    # check queue again in 500ms
-    main_root.after(500, lambda: check_queue(main_root, event_handler))
-
-# start running folder watcher
 observer.start()
 
-# create master window on main thread
 main_root = tk.Tk()
 main_root.title("File Organiser Dashboard")
-main_root.geometry("400x310") # Expanded height so all buttons fit properly
+main_root.geometry("400x350")
 
-# status header
 tk.Label(main_root, text="File Organiser Dashboard", font=("Arial", 12, "bold")).pack(pady=(15, 5))
 tk.Label(main_root, text=f"monitoring: {downloads_folder}", font=("Arial", 9), fg="gray").pack(pady=(0, 15))
 
-# dashboard options
+tray_icon = None
+
+def show_dashboard():
+    main_root.after(0, main_root.deiconify)
+
+def hide_dashboard():
+    main_root.withdraw()
+
+def quit_app():
+    if tray_icon:
+        tray_icon.stop()
+    observer.stop()
+    main_root.after(0, main_root.destroy)
+
+def setup_tray_icon():
+    global tray_icon
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Dashboard", lambda: show_dashboard()),
+        pystray.MenuItem("Exit & Stop Monitoring", lambda: quit_app())
+    )
+    tray_icon = pystray.Icon("FileOrganiser", create_tray_image(), "File Organiser (Running)", menu)
+    tray_icon.run()
+
+threading.Thread(target=setup_tray_icon, daemon=True).start()
+
 def dashboard_add_rule():
     ext = simpledialog.askstring("Add Rule", "Enter file extension (e.g. .pdf):")
     if ext:
@@ -363,34 +258,26 @@ def dashboard_add_rule():
             add_rule(ext.lower(), target_dir)
             messagebox.showinfo("Rule Saved", f"Added Rule: {ext.lower()} to {target_dir}")
 
-
 def dashboard_remove_rule():
-    # get all saved rules from database
     rules = get_all_rules()
-
-    # if no rules exist show message and stop
     if not rules:
         messagebox.showinfo("No Rules", "You do not have any custom auto-sort rules yet.")
         return
 
-    # open a popup window for removing a saved rule
     remove_window = tk.Toplevel(main_root)
     remove_window.title("Remove Auto-Sort Rule")
     remove_window.geometry("450x260")
     remove_window.transient(main_root)
     remove_window.grab_set()
 
-    # show title inside remove rule window
     tk.Label(remove_window, text="Select a rule to remove:", font=("Arial", 10, "bold")).pack(pady=(10, 5))
 
-    # list each saved rule so user can pick one
     rule_list = tk.Listbox(remove_window, height=min(10, len(rules)), width=60)
     for rule in rules:
         rule_list.insert(tk.END, f"{rule['extension']} -> {rule['destination']}")
     rule_list.pack(fill='both', expand=True, padx=10, pady=5)
 
     def remove_selected_rule():
-        # get the user's selected rule from the list
         selection = rule_list.curselection()
         if not selection:
             messagebox.showwarning("No Selection", "Please select a rule to remove.")
@@ -399,27 +286,65 @@ def dashboard_remove_rule():
         selected_index = selection[0]
         selected_rule = rules[selected_index]
 
-        # confirm before deleting the rule
         confirm = messagebox.askyesno(
             "Confirm Removal",
             f"Remove the rule for '{selected_rule['extension']}'?"
         )
 
         if confirm:
-            # delete selected rule from database
             delete_rule(selected_rule['id'])
             messagebox.showinfo("Rule Removed", f"Removed rule for {selected_rule['extension']}")
             remove_window.destroy()
 
-    # button to remove the selected rule
     tk.Button(remove_window, text="Remove Selected Rule", command=remove_selected_rule).pack(pady=(0, 10))
 
+def dashboard_view_history():
+    history = get_action_history()
+    if not history:
+        messagebox.showinfo("File History", "No file movements logged yet.")
+        return
+
+    history_win = tk.Toplevel(main_root)
+    history_win.title("File Move History")
+    history_win.geometry("600x350")
+    history_win.attributes("-topmost", True)
+
+    tk.Label(history_win, text="Recent File Actions Log", font=("Arial", 10, "bold")).pack(pady=10)
+
+    frame = tk.Frame(history_win)
+    frame.pack(fill='both', expand=True, padx=15, pady=5)
+
+    scrollbar = ttk.Scrollbar(frame)
+    scrollbar.pack(side='right', fill='y')
+
+    columns = ("file_name", "action", "destination")
+    tree = ttk.Treeview(frame, columns=columns, show='headings', yscrollcommand=scrollbar.set)
+    scrollbar.config(command=tree.yview)
+
+    tree.heading("file_name", text="File Name")
+    tree.heading("action", text="Action")
+    tree.heading("destination", text="Destination")
+
+    tree.column("file_name", width=150)
+    tree.column("action", width=110)
+    tree.column("destination", width=300)
+
+    for log in history:
+        tree.insert('', tk.END, values=(log["file_name"], log["action"], log["destination"]))
+
+    tree.pack(fill='both', expand=True)
 
 def dashboard_open_downloads():
     os.startfile(downloads_folder)
 
-def on_closing():
-    main_root.destroy()
+def check_queue(main_root, event_handler):
+    try:
+        file_name, file_path = file_queue.get_nowait()
+        event_handler.trigger_popup(file_name, file_path, main_root)
+    except queue.Empty:
+        pass
+
+    main_root.after(500, lambda: check_queue(main_root, event_handler))
 
 btn_add_rule = tk.Button(main_root, text="Add Custom Auto-Sort Rule", command=dashboard_add_rule)
 btn_add_rule.pack(fill='x', padx=40, pady=4)
@@ -433,18 +358,20 @@ btn_view_history.pack(fill='x', padx=40, pady=4)
 btn_open_downloads = tk.Button(main_root, text="Open Downloads Folder", command=dashboard_open_downloads)
 btn_open_downloads.pack(fill='x', padx=40, pady=4)
 
-btn_exit = tk.Button(main_root, text="Exit & Stop Monitoring", command=on_closing)
+btn_hide = tk.Button(main_root, text="Hide to Tray (Keep Monitoring)", command=hide_dashboard)
+btn_hide.pack(fill='x', padx=40, pady=4)
+
+btn_exit = tk.Button(main_root, text="Exit & Stop Monitoring", command=quit_app)
 btn_exit.pack(fill='x', padx=40, pady=4)
 
-# start checking queue
+main_root.protocol("WM_DELETE_WINDOW", hide_dashboard)
+
 check_queue(main_root, event_handler)
 
 try:
-    # use tkinter main loop to keep script alive
     main_root.mainloop()
 except KeyboardInterrupt:
     pass
 finally:
-    # cleanly stop watcher
     observer.stop()
     observer.join()
